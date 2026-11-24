@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""keycast-overlay: a small click-through overlay showing recent key presses.
+
+The newest HIGHLIGHT keys get a gold outline and bright white text; older
+keys are drawn dimmer. Key events come from showmethekey-cli (run through
+pkexec; wheel members need no password). Nothing is written to disk.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+
+# gtk4-layer-shell must be loaded before libwayland-client.
+if "keycast-preloaded" not in os.environ.get("KEYCAST_FLAG", ""):
+    os.environ["LD_PRELOAD"] = "/usr/lib/libgtk4-layer-shell.so"
+    os.environ["KEYCAST_FLAG"] = "keycast-preloaded"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import cairo  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gio, GLib, Gtk, Gdk, Gtk4LayerShell as LayerShell  # noqa: E402
+
+# ---- Settings -------------------------------------------------------------
+MAX_KEYS = 8          # how many keys to keep on screen
+HIGHLIGHT = 3         # how many of the newest keys get the gold highlight
+FONT_SIZE = 11        # px
+MARGIN_TOP = 4        # gap below the bar
+MARGIN_RIGHT = 8      # gap from the right screen edge
+CLEAR_AFTER = 0       # seconds idle before clearing (0 = never clear)
+
+CSS = f"""
+window {{ background: transparent; }}
+.chip {{
+  font-size: {FONT_SIZE}px;
+  font-weight: 600;
+  padding: 1px 6px;
+  margin-left: 4px;
+  border-radius: 5px;
+  color: rgba(255,255,255,0.45);
+  background: rgba(20,20,20,0.45);
+  border: 1px solid rgba(255,255,255,0.12);
+}}
+.chip.recent {{
+  color: #ffffff;
+  font-weight: 800;
+  background: rgba(20,20,20,0.75);
+  border: 1px solid #d4af37;
+  box-shadow: 0 0 4px rgba(212,175,55,0.55);
+}}
+"""
+
+MODS = {
+    "KEY_LEFTCTRL": "Ctrl", "KEY_RIGHTCTRL": "Ctrl",
+    "KEY_LEFTSHIFT": "Shift", "KEY_RIGHTSHIFT": "Shift",
+    "KEY_LEFTALT": "Alt", "KEY_RIGHTALT": "AltGr",
+    "KEY_LEFTMETA": "Super", "KEY_RIGHTMETA": "Super",
+}
+MOD_ORDER = ["Super", "Ctrl", "Alt", "AltGr", "Shift"]
+NAMES = {
+    "SPACE": "Space", "ENTER": "Enter", "KPENTER": "Enter", "BACKSPACE": "⌫",
+    "TAB": "Tab", "ESC": "Esc", "DELETE": "Del", "INSERT": "Ins",
+    "UP": "↑", "DOWN": "↓", "LEFT": "←", "RIGHT": "→",
+    "PAGEUP": "PgUp", "PAGEDOWN": "PgDn", "HOME": "Home", "END": "End",
+    "CAPSLOCK": "Caps", "MINUS": "-", "EQUAL": "=", "LEFTBRACE": "[",
+    "RIGHTBRACE": "]", "SEMICOLON": ";", "APOSTROPHE": "'", "GRAVE": "`",
+    "BACKSLASH": "\\", "COMMA": ",", "DOT": ".", "SLASH": "/",
+    "SYSRQ": "PrtSc", "PRINT": "PrtSc",
+}
+
+
+def pretty(key_name):
+    k = key_name[4:] if key_name.startswith("KEY_") else key_name
+    return NAMES.get(k, k.capitalize() if len(k) > 1 else k)
+
+
+class Overlay(Gtk.Application):
+    def __init__(self):
+        # Single instance: launching it again while running does nothing.
+        # The demo runs separately so it can be previewed beside a live one.
+        demo = bool(os.environ.get("KEYCAST_DEMO"))
+        super().__init__(
+            application_id="io.github.keycast.overlay",
+            flags=Gio.ApplicationFlags.NON_UNIQUE if demo
+            else Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.keys = []          # newest last
+        self.held = set()       # currently held modifier labels
+        self.mod_used = False   # a non-modifier was pressed while mods held
+        self.clear_id = 0
+        self.win = None
+
+    def do_activate(self):
+        # A second launch re-activates this instance; never start a
+        # second window or key reader (that showed every key twice).
+        if self.win is not None:
+            return
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        win = Gtk.ApplicationWindow(application=self)
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "keycast-overlay")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
+        LayerShell.set_margin(win, LayerShell.Edge.TOP, MARGIN_TOP)
+        LayerShell.set_margin(win, LayerShell.Edge.RIGHT, MARGIN_RIGHT)
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.box.set_halign(Gtk.Align.END)
+        win.set_child(self.box)
+
+        # Empty input region => every click passes through to what's below.
+        def make_clickthrough(*_):
+            surf = win.get_surface()
+            if surf:
+                surf.set_input_region(cairo.Region())
+        win.connect("realize", make_clickthrough)
+        win.connect("map", make_clickthrough)
+
+        win.set_visible(False)  # shown once the first key arrives
+        self.win = win
+        threading.Thread(target=self.reader, daemon=True).start()
+
+    # ---- key handling -----------------------------------------------------
+    def reader(self):
+        if os.environ.get("KEYCAST_DEMO"):  # preview with sample keys
+            for k in ["H", "E", "L", "Ctrl+C", "Super+Enter", "Space", "⌫", "Super"]:
+                GLib.idle_add(self.push, k)
+            return
+        proc = subprocess.Popen(
+            ["pkexec", "/usr/bin/showmethekey-cli"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("event_name") == "KEYBOARD_KEY":
+                GLib.idle_add(self.on_key, ev["key_name"], ev["state_name"])
+        GLib.idle_add(self.quit)
+
+    def on_key(self, name, state):
+        pressed = state == "PRESSED"
+        if name in MODS:
+            label = MODS[name]
+            if pressed:
+                if not self.held:
+                    self.mod_used = False
+                self.held.add(label)
+            else:
+                # A lone modifier tap (e.g. just Super) is still shown.
+                if not self.mod_used and self.held == {label}:
+                    self.push(label)
+                self.held.discard(label)
+            return False
+        if pressed:
+            mods = [m for m in MOD_ORDER if m in self.held]
+            self.mod_used = bool(mods)
+            self.push("+".join(mods + [pretty(name)]))
+        return False
+
+    def push(self, text):
+        self.keys.append(text)
+        del self.keys[:-MAX_KEYS]
+        self.redraw()
+        if CLEAR_AFTER:
+            if self.clear_id:
+                GLib.source_remove(self.clear_id)
+            self.clear_id = GLib.timeout_add_seconds(CLEAR_AFTER, self.clear)
+
+    def clear(self):
+        self.keys.clear()
+        self.clear_id = 0
+        self.redraw()
+        return False
+
+    def redraw(self):
+        while (child := self.box.get_first_child()) is not None:
+            self.box.remove(child)
+        n = len(self.keys)
+        for i, text in enumerate(self.keys):
+            lbl = Gtk.Label(label=text)
+            lbl.add_css_class("chip")
+            if i >= n - HIGHLIGHT:
+                lbl.add_css_class("recent")
+            self.box.append(lbl)
+        self.win.set_visible(n > 0)
+        if n:
+            surf = self.win.get_surface()
+            if surf:
+                surf.set_input_region(cairo.Region())
+
+
+if __name__ == "__main__":
+    Overlay().run([])
