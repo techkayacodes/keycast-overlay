@@ -10,6 +10,16 @@ see what you just pressed.
 It works well for screen recordings, tutorials, live streams, and pair
 programming.
 
+## Cross-Platform Editions
+
+Looking for **Windows** or **macOS**? The `keycast-overlay` family is available natively across all three major desktop platforms:
+
+| Platform | Repository | Highlights |
+|---|---|---|
+| **Windows 10 / 11** *(Featured)* | [techkayacodes/keycast-overlay-windows](https://github.com/techkayacodes/keycast-overlay-windows) | Standalone clickable [`.exe` download](https://github.com/techkayacodes/keycast-overlay-windows/releases/latest) (no Python/CLI needed), native Win32 hook, system tray |
+| **macOS 13+** | [techkayacodes/keycast-overlay-macos](https://github.com/techkayacodes/keycast-overlay-macos) | Native Swift / AppKit `NSPanel`, `CGEventTap`, clickable `.app` bundler, menu bar controls |
+| **Linux (Wayland)** *(this repo — Original)* | [techkayacodes/keycast-overlay](https://github.com/techkayacodes/keycast-overlay) | GTK 4 + `gtk4-layer-shell` + `showmethekey-cli` |
+
 ## Features
 
 - Shows the last 8 keys. The 3 newest are highlighted in gold.
